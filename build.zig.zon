@@ -1,0 +1,22 @@
+// SPDX-License-Identifier: BSD-2-Clause
+
+.{
+    .name = .fluxion_font,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .fingerprint = 0x7658420be2537a7f,
+    .dependencies = .{
+        // None, and that is the point. A font file is bytes, and turning
+        // bytes into coverage needs arithmetic and an allocator. Nothing
+        // here opens a window, decodes an image or talks to a GPU, so
+        // nothing here depends on the packages that do.
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "examples",
+        "README.md",
+        "LICENSE",
+    },
+}
