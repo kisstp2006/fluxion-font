@@ -153,8 +153,8 @@ pub const Tag = enum(u32) {
     post = tag("post"),
     /// `OS/2`, which has a slash in it, because 1990.
     os2 = tag("OS/2"),
-    /// PostScript outlines. Present instead of `glyf` in an OpenType font,
-    /// and not read here - see the note in `Font`.
+    /// PostScript outlines, present instead of `glyf` and `loca` in an
+    /// OpenType font of that flavour. Read by `cff`.
     cff = tag("CFF "),
     _,
 
@@ -251,11 +251,10 @@ pub const File = struct {
 
     /// Whether the outlines are PostScript rather than TrueType.
     ///
-    /// Worth asking early and reporting clearly: a `CFF ` font parses its
-    /// directory, its character map and its metrics perfectly well here, and
-    /// then has no `glyf` table to get a shape out of. Failing at
-    /// `Font.init` with a name for the problem beats failing at the first
-    /// glyph with `MissingTable`.
+    /// The file's own answer is its first four bytes - `OTTO` against
+    /// `0x00010000` - but the table is what matters, and a few fonts in the
+    /// wild carry the wrong version for what they hold. Asking for the
+    /// `CFF ` table is asking the question that has a consequence.
     pub fn isPostScript(self: File) bool {
         return (self.find(.cff) catch null) != null;
     }

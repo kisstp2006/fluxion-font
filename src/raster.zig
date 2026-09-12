@@ -129,6 +129,10 @@ pub fn rasterize(gpa: Allocator, shape: Outline, width: u32, height: u32) Alloca
                 pen.quadratic(at, q.control, q.to);
                 at = q.to;
             },
+            .cubic => |c| {
+                pen.cubic(at, c.control1, c.control2, c.to);
+                at = c.to;
+            },
             .close => {
                 pen.line(at, start);
                 at = start;
@@ -310,6 +314,38 @@ const Pen = struct {
             previous = next;
         }
     }
+
+    /// Chop a cubic into straight lines and draw those.
+    ///
+    /// The same idea as `quadratic` with one more control point: a cubic has
+    /// two second differences rather than one, and how bent it is anywhere
+    /// is bounded by the larger. That bound is three times what a quadratic
+    /// with the same difference would give, because a cubic's second
+    /// derivative carries a factor of six where a quadratic's carries two -
+    /// which is where the nine comes from, being three squared.
+    fn cubic(self: *Pen, from: Point, control1: Point, control2: Point, to: Point) void {
+        const d1x = from.x - 2 * control1.x + control2.x;
+        const d1y = from.y - 2 * control1.y + control2.y;
+        const d2x = control1.x - 2 * control2.x + to.x;
+        const d2y = control1.y - 2 * control2.y + to.y;
+        const deviation = 9 * @max(d1x * d1x + d1y * d1y, d2x * d2x + d2y * d2y);
+
+        if (deviation < 0.333) {
+            self.line(from, to);
+            return;
+        }
+
+        const steps: u32 = @intFromFloat(1 + @floor(@sqrt(@sqrt(flatness * deviation))));
+        const count = @min(steps, 64);
+
+        var previous = from;
+        for (1..count + 1) |i| {
+            const t = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(count));
+            const next = evaluateCubic(from, control1, control2, to, t);
+            self.line(previous, next);
+            previous = next;
+        }
+    }
 };
 
 /// A point on a quadratic curve at parameter `t`.
@@ -321,6 +357,22 @@ fn evaluate(from: Point, control: Point, to: Point, t: f32) Point {
     return .{
         .x = a * from.x + b * control.x + c * to.x,
         .y = a * from.y + b * control.y + c * to.y,
+    };
+}
+
+/// A point on a cubic curve at parameter `t`: the Bernstein form, which is
+/// the four weights `(1-t)³, 3(1-t)²t, 3(1-t)t², t³` applied to the four
+/// points. They sum to one, so the result is always somewhere inside the
+/// hull the points make.
+fn evaluateCubic(from: Point, control1: Point, control2: Point, to: Point, t: f32) Point {
+    const one_minus = 1 - t;
+    const a = one_minus * one_minus * one_minus;
+    const b = 3 * one_minus * one_minus * t;
+    const c = 3 * one_minus * t * t;
+    const d = t * t * t;
+    return .{
+        .x = a * from.x + b * control1.x + c * control2.x + d * to.x,
+        .y = a * from.y + b * control1.y + c * control2.y + d * to.y,
     };
 }
 
@@ -534,6 +586,41 @@ test "a curve is smooth, not a staircase" {
 
     // Somewhere along the edge there is a partial pixel, which is what says
     // the curve was antialiased rather than stepped.
+    var partial: usize = 0;
+    for (bitmap.pixels) |p| {
+        if (p > 10 and p < 245) partial += 1;
+    }
+    try testing.expect(partial > 8);
+}
+
+test "a cubic is smooth too, and covers what a circle would" {
+    // A quarter-disc drawn the PostScript way: one cubic with the control
+    // points at the magic 0.5523 of the radius that makes a cubic hug a
+    // circle to within a fraction of a percent. The area of a quarter of a
+    // 16-pixel disc is 64π, which is the number the coverage has to land on
+    // for the flattening to be fine enough.
+    var shape: Outline = .{};
+    defer shape.deinit(testing.allocator);
+
+    const k: f32 = 0.5523 * 16;
+    var builder: outline.Builder = .init(testing.allocator, &shape);
+    try builder.moveTo(.init(16, 16));
+    try builder.lineTo(.init(0, 16));
+    try builder.cubicTo(.init(0, 16 - k), .init(16 - k, 0), .init(16, 0));
+    try builder.close();
+
+    var bitmap = try rasterize(testing.allocator, shape, 16, 16);
+    defer bitmap.deinit(testing.allocator);
+
+    try testing.expectEqual(0, bitmap.at(0, 0));
+    try testing.expectEqual(255, bitmap.at(15, 15));
+    // A little under, always: the chords a curve is chopped into lie inside
+    // the arc, and seven of them around a quarter of this circle give up
+    // about a pixel and a half between them. That is the tolerance
+    // `flatness` chose, made visible - a tenth of a pixel of sag on each
+    // chord, which no byte of coverage can show.
+    try testing.expectApproxEqAbs(64 * std.math.pi, coverage(bitmap), 2.5);
+
     var partial: usize = 0;
     for (bitmap.pixels) |p| {
         if (p > 10 and p < 245) partial += 1;

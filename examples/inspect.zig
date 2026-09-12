@@ -64,6 +64,7 @@ pub fn main(init: std.process.Init) !void {
         characters.format,
         if (characters.symbol) ", symbol" else "",
     });
+    try w.print("  {s} outlines\n", .{if (file.isPostScript()) "PostScript" else "TrueType"});
 
     var entries: [64]font.sfnt.Entry = undefined;
     const tables = try file.entries(&entries);
@@ -111,12 +112,16 @@ fn drawLine(
     var shape: font.outline.Outline = .empty;
     defer shape.deinit(gpa);
 
+    // Whichever kind of outline the font has. The rest of this function
+    // cannot tell, and that is the point of `Outlines`.
+    const outlines: font.Outlines = try .read(file);
+
     var pen_x: f32 = 1;
     var letters = (try std.unicode.Utf8View.init(text)).iterator();
     while (letters.nextCodepoint()) |codepoint| {
         const glyph = characters.lookup(codepoint);
 
-        try font.glyf.read(gpa, file, glyph, &shape);
+        try outlines.outlineOf(gpa, glyph, &shape);
         if (!shape.isEmpty()) {
             const place: font.raster.Placement = .init(shape.bounds(), scale);
             place.apply(&shape);
@@ -255,7 +260,7 @@ test "a real capital H has two uprights and a gap between them" {
 
     var shape: font.outline.Outline = .empty;
     defer shape.deinit(testing.allocator);
-    try font.glyf.read(testing.allocator, file, characters.lookup('H'), &shape);
+    try (try font.Outlines.read(file)).outlineOf(testing.allocator, characters.lookup('H'), &shape);
     try testing.expect(!shape.isEmpty());
 
     const scale = 64.0 / @as(f32, @floatFromInt(head.units_per_em));
@@ -287,7 +292,7 @@ test "a real lowercase o is a ring with a hole in it" {
 
     var shape: font.outline.Outline = .empty;
     defer shape.deinit(testing.allocator);
-    try font.glyf.read(testing.allocator, file, characters.lookup('o'), &shape);
+    try (try font.Outlines.read(file)).outlineOf(testing.allocator, characters.lookup('o'), &shape);
 
     // Two contours: the outside and the inside.
     try testing.expectEqual(2, shape.contourCount());
@@ -319,7 +324,7 @@ test "a real space has an advance and no pixels" {
 
     var shape: font.outline.Outline = .empty;
     defer shape.deinit(testing.allocator);
-    try font.glyf.read(testing.allocator, file, space, &shape);
+    try (try font.Outlines.read(file)).outlineOf(testing.allocator, space, &shape);
     try testing.expect(shape.isEmpty());
 }
 
@@ -333,7 +338,7 @@ test "every glyph in a real font reads without a bounds error" {
 
     const file = try font.sfnt.File.init(bytes);
     const maxp = try font.tables.Maxp.read(file);
-    const table: font.glyf.Glyf = try .read(file);
+    const table: font.Outlines = try .read(file);
 
     var shape: font.outline.Outline = .empty;
     defer shape.deinit(testing.allocator);
@@ -347,4 +352,58 @@ test "every glyph in a real font reads without a bounds error" {
     // And most of them had something in them, which says the loop was
     // reading outlines rather than quietly finding nothing.
     try testing.expect(drawn > maxp.glyph_count / 2);
+}
+
+/// A PostScript-flavoured OpenType font from the system, or null. See
+/// `Font.systemPostScriptFont` for where the candidates come from.
+fn systemPostScriptFont(gpa: std.mem.Allocator) !?[]u8 {
+    const candidates = [_][]const u8{
+        "C:/Windows/Fonts/FrankRuhlHofshi-Regular.otf",
+        "C:/Windows/Fonts/DavidCLM-Medium.otf",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/OTF/SourceSans3-Regular.otf",
+    };
+    for (candidates) |path| {
+        return std.Io.Dir.cwd().readFileAlloc(testing.io, path, gpa, .limited(32 << 20)) catch continue;
+    }
+    return null;
+}
+
+test "every glyph in a real PostScript font runs without an error, and an H is still an H" {
+    // The same walk as above over charstrings rather than point rings:
+    // every operator a real font uses, every subroutine it calls with its
+    // bias, every hintmask with its bytes - and any one of them misread
+    // shows up here as an error or as a letter that is not one.
+    const bytes = try systemPostScriptFont(testing.allocator) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+
+    const file = try font.sfnt.File.init(bytes);
+    try testing.expect(file.isPostScript());
+    const head = try font.tables.Head.read(file);
+    const maxp = try font.tables.Maxp.read(file);
+    const characters = try font.cmap.Cmap.read(file);
+    const table: font.Outlines = try .read(file);
+
+    var shape: font.outline.Outline = .empty;
+    defer shape.deinit(testing.allocator);
+
+    var drawn: usize = 0;
+    for (0..maxp.glyph_count) |i| {
+        try table.outlineOf(testing.allocator, @intCast(i), &shape);
+        if (!shape.isEmpty()) drawn += 1;
+    }
+    try testing.expect(drawn > maxp.glyph_count / 2);
+
+    try table.outlineOf(testing.allocator, characters.lookup('H'), &shape);
+    try testing.expect(!shape.isEmpty());
+
+    const scale = 64.0 / @as(f32, @floatFromInt(head.units_per_em));
+    const place: font.raster.Placement = .init(shape.bounds(), scale);
+    place.apply(&shape);
+
+    var bitmap = try font.raster.rasterize(testing.allocator, shape, place.width, place.height);
+    defer bitmap.deinit(testing.allocator);
+
+    try testing.expectEqual(2, inkRuns(bitmap, 2));
+    try testing.expectEqual(1, inkRuns(bitmap, bitmap.height / 2));
 }

@@ -1,6 +1,7 @@
 # Fluxion Font
 
-A TrueType file, and the pixels it describes. For Zig 0.16. No dependencies.
+A TrueType or OpenType file, and the pixels it describes. For Zig 0.16. No
+dependencies.
 
 | Module | What it is |
 | --- | --- |
@@ -8,8 +9,9 @@ A TrueType file, and the pixels it describes. For Zig 0.16. No dependencies.
 | `sfnt` | The container a font file is: a directory of tables, read without believing any of it. |
 | `tables` | The ones every font has - `head`, `hhea`, `maxp`, `OS/2`, `hmtx` - as structs. |
 | `cmap` | A character to the glyph that draws it. Formats 0, 4, 6 and 12. |
-| `glyf` | A glyph to its outline, composites included. |
-| `outline` | The shape itself: closed contours of lines and quadratic curves. |
+| `glyf` | A TrueType glyph to its outline, composites included. |
+| `cff` | A PostScript glyph to its outline, by running its charstring. |
+| `outline` | The shape itself: closed contours of lines and curves, quadratic or cubic. |
 | `raster` | The outline to coverage, with the edges smoothed. |
 
 ```zig
@@ -59,14 +61,23 @@ that do - which also means it builds for `wasm32-freestanding` unchanged.
 ## The path a glyph takes
 
 ```
-bytes ──▶ sfnt ──▶ cmap ──▶ glyf ──▶ outline ──▶ raster ──▶ coverage
-        directory  'H' is   glyph 43  contours   pixels
-        of tables  glyph 43 is these  of curves
+bytes ──▶ sfnt ──▶ cmap ──▶ glyf | cff ──▶ outline ──▶ raster ──▶ coverage
+        directory  'H' is   glyph 43     contours   pixels
+        of tables  glyph 43 is these     of curves
 ```
 
 Each step is a module, and each can be used on its own: a tool that lists
-tables needs `sfnt`; a validator that walks every glyph needs `glyf`; a
-renderer needs all of them, and holds a `Font` instead.
+tables needs `sfnt`; a validator that walks every glyph needs `glyf` or
+`cff`; a renderer needs all of them, and holds a `Font` instead.
+
+The fork in the middle is the one thing about OpenType worth knowing before
+opening a file. A TrueType font stores each glyph as rings of points in
+`glyf`, with quadratic curves between them. A PostScript-flavoured one - the
+`.otf` a foundry sells, and most of what is served as a webfont - stores each
+glyph as a **charstring** in `CFF `: a small program in a stack language,
+with cubic curves, subroutines and hints, that a reader runs to find out what
+the glyph looks like. `Font.Outlines` holds whichever the file has, and
+everything above it gets an `outline.Outline` either way.
 
 ## Nothing here trusts the file
 
@@ -89,7 +100,8 @@ real files rather than hypothetical ones:
   rather than refused. Fonts in the wild do this to their last table.
 - **A composite glyph that refers to itself** stops at
   `glyf.max_composite_depth` with an error, rather than recursing until the
-  stack runs out.
+  stack runs out. A charstring subroutine that calls itself stops the same
+  way at `cff.max_subroutine_depth`.
 
 ## The rasteriser
 
@@ -117,6 +129,10 @@ The idea is Raph Levien's, from font-rs.
 Read and tested:
 
 - TrueType outlines (`glyf`), simple and composite, under any two-by-two transform
+- PostScript outlines (`CFF `): the whole Type 2 charstring set - lines,
+  curves, flex, hints counted and skipped, local and global subroutines with
+  their bias, `seac` accent composition - and CID-keyed fonts with a Private
+  DICT per font dict, which is what every CJK OpenType font is
 - Character maps in formats 0, 4, 6 and 12, including the Windows Symbol shift
 - `head`, `hhea`, `hmtx`, `maxp`, `OS/2`, and `kern` in format 0
 - TrueType collections (`.ttc`), one font at a time
@@ -126,7 +142,7 @@ Not here, and each for a reason:
 
 | | Why |
 | --- | --- |
-| **PostScript outlines (`CFF `)** | A different format - cubic curves and a charstring interpreter. `Font.init` answers `error.PostScriptOutlines` rather than half-reading one. Every font shipped with Windows and macOS, and the usual open families, have `glyf`. |
+| **`CFF2` and variable fonts** | The variable form of both outline formats blends several sets of coordinates by an axis position, and `CFF2` has a different header and DICT-less layout to go with it. A static instance of any variable font reads fine; the variation itself is a second library. |
 | **Hinting** | A bytecode stack machine with about eighty instructions, whose result is only visible below fourteen pixels on a display that is not high-density. A good antialiased rasteriser instead is the trade every modern text stack has made. |
 | **Shaping** | Ligatures, marks and reordering need `GSUB` and `GPOS`, which are their own library. One glyph per codepoint plus `kern` pairs is correct for Latin, Greek, Cyrillic and CJK. |
 | **A glyph atlas** | Packing rasterised glyphs into one texture belongs with whatever owns the texture. This hands you the coverage. |
@@ -145,6 +161,7 @@ C:/Windows/Fonts/consola.ttf
   3031 glyphs, em square 2048 units
   ascender 1521, descender -527, line 2398 units
   character map format 4
+  TrueType outlines
   tables: GDEF GPOS GSUB MERG OS/2 cmap cvt  fpgm gasp glyf head hhea hmtx loca maxp meta name post prep
 
   #@      @%

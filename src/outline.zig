@@ -10,10 +10,13 @@
 //! needs forty. Flattening here would have to guess; flattening in `raster`
 //! knows.
 //!
-//! **Quadratic, not cubic.** TrueType curves have one control point, which is
-//! why `Command.quadratic` has one and there is no `cubic`. PostScript
-//! outlines in a `CFF ` table are cubic, and are not read by this library -
-//! see the note in `Font`.
+//! **Two kinds of curve, because two kinds of font.** A TrueType curve has
+//! one control point and a PostScript one has two, and the same letter drawn
+//! in both formats is two different lists of numbers. `Command.quadratic`
+//! is what `glyf` produces and `Command.cubic` is what `cff` produces, and
+//! the rasteriser flattens either - which is what lets everything above it
+//! not care which kind of font it was handed. Converting one to the other
+//! here would be lossy in one direction and pointless in the other.
 //!
 //! The coordinates are **font units** with y upwards, exactly as the file
 //! stores them. Turning them into pixels with y downwards is one transform,
@@ -90,10 +93,15 @@ pub const Command = union(enum) {
     move: Point,
     /// A straight line from wherever the pen is to here.
     line: Point,
-    /// A quadratic curve, through `control`, ending at `to`.
+    /// A quadratic curve, through `control`, ending at `to`. What TrueType
+    /// outlines are made of.
     quadratic: struct { control: Point, to: Point },
-    /// Back to where this contour started. TrueType contours are always
-    /// closed, so every `move` eventually gets one of these.
+    /// A cubic curve, pulled towards `control1` on the way out and
+    /// `control2` on the way in, ending at `to`. What PostScript outlines are
+    /// made of.
+    cubic: struct { control1: Point, control2: Point, to: Point },
+    /// Back to where this contour started. Glyph contours are always closed,
+    /// so every `move` eventually gets one of these.
     close,
 
     /// Where the pen ends up. Null for `close`, which returns it to the start
@@ -103,7 +111,30 @@ pub const Command = union(enum) {
             .move => |p| p,
             .line => |p| p,
             .quadratic => |q| q.to,
+            .cubic => |c| c.to,
             .close => null,
+        };
+    }
+
+    /// The same command with every point put through `f`. What `transform`
+    /// and `affine` are underneath, written once so a third kind of curve
+    /// would need adding in one place rather than three.
+    ///
+    /// `f` is a function *type* known at compile time, and the call is
+    /// resolved and inlined for each caller - so this costs nothing over
+    /// writing the switch out by hand at each site, which is what Zig's
+    /// `comptime` parameters are for.
+    fn map(self: Command, context: anytype, comptime f: fn (@TypeOf(context), Point) Point) Command {
+        return switch (self) {
+            .move => |p| .{ .move = f(context, p) },
+            .line => |p| .{ .line = f(context, p) },
+            .quadratic => |q| .{ .quadratic = .{ .control = f(context, q.control), .to = f(context, q.to) } },
+            .cubic => |c| .{ .cubic = .{
+                .control1 = f(context, c.control1),
+                .control2 = f(context, c.control2),
+                .to = f(context, c.to),
+            } },
+            .close => .close,
         };
     }
 };
@@ -145,11 +176,11 @@ pub const Outline = struct {
     /// than its outline, and several do. For deciding how many pixels to
     /// allocate, the real one is the one that matters.
     ///
-    /// The control point of a curve is included, which makes this box a
-    /// little larger than the true one - a quadratic never reaches its
-    /// control point. Being generous costs a row of empty pixels in an atlas;
-    /// being exact costs solving for the extrema of every curve, and nobody
-    /// has ever noticed the difference.
+    /// The control points of a curve are included, which makes this box a
+    /// little larger than the true one - a curve never reaches its control
+    /// points. Being generous costs a row of empty pixels in an atlas; being
+    /// exact costs solving for the extrema of every curve, and nobody has
+    /// ever noticed the difference.
     pub fn bounds(self: Outline) Bounds {
         var box: Bounds = .empty;
         for (self.commands.items) |command| {
@@ -158,6 +189,11 @@ pub const Outline = struct {
                 .quadratic => |q| {
                     box.include(q.control);
                     box.include(q.to);
+                },
+                .cubic => |c| {
+                    box.include(c.control1);
+                    box.include(c.control2);
+                    box.include(c.to);
                 },
                 .close => {},
             }
@@ -169,23 +205,18 @@ pub const Outline = struct {
     /// y. What a composite glyph does to its parts, and what turning font
     /// units into pixels does to the whole thing.
     pub fn transform(self: *Outline, scale_x: f32, scale_y: f32, offset_x: f32, offset_y: f32) void {
-        const move = struct {
-            fn point(p: Point, sx: f32, sy: f32, ox: f32, oy: f32) Point {
-                return .{ .x = p.x * sx + ox, .y = p.y * sy + oy };
-            }
-        }.point;
+        const Scale = struct {
+            sx: f32,
+            sy: f32,
+            ox: f32,
+            oy: f32,
 
-        for (self.commands.items) |*command| {
-            switch (command.*) {
-                .move => |*p| p.* = move(p.*, scale_x, scale_y, offset_x, offset_y),
-                .line => |*p| p.* = move(p.*, scale_x, scale_y, offset_x, offset_y),
-                .quadratic => |*q| {
-                    q.control = move(q.control, scale_x, scale_y, offset_x, offset_y);
-                    q.to = move(q.to, scale_x, scale_y, offset_x, offset_y);
-                },
-                .close => {},
+            fn point(s: @This(), p: Point) Point {
+                return .{ .x = p.x * s.sx + s.ox, .y = p.y * s.sy + s.oy };
             }
-        }
+        };
+        const scale: Scale = .{ .sx = scale_x, .sy = scale_y, .ox = offset_x, .oy = offset_y };
+        for (self.commands.items) |*command| command.* = command.map(scale, Scale.point);
     }
 
     /// The general form: `x' = a*x + c*y + dx`, `y' = b*x + d*y + dy`.
@@ -195,26 +226,23 @@ pub const Outline = struct {
     /// from an `a` and a dieresis, and how some fonts build a small-capital
     /// from a capital by squashing it at a slight angle.
     pub fn affine(self: *Outline, a: f32, b: f32, c: f32, d: f32, dx: f32, dy: f32) void {
-        const move = struct {
-            fn point(p: Point, ma: f32, mb: f32, mc: f32, md: f32, ox: f32, oy: f32) Point {
+        const Matrix = struct {
+            a: f32,
+            b: f32,
+            c: f32,
+            d: f32,
+            dx: f32,
+            dy: f32,
+
+            fn point(m: @This(), p: Point) Point {
                 return .{
-                    .x = ma * p.x + mc * p.y + ox,
-                    .y = mb * p.x + md * p.y + oy,
+                    .x = m.a * p.x + m.c * p.y + m.dx,
+                    .y = m.b * p.x + m.d * p.y + m.dy,
                 };
             }
-        }.point;
-
-        for (self.commands.items) |*command| {
-            switch (command.*) {
-                .move => |*p| p.* = move(p.*, a, b, c, d, dx, dy),
-                .line => |*p| p.* = move(p.*, a, b, c, d, dx, dy),
-                .quadratic => |*q| {
-                    q.control = move(q.control, a, b, c, d, dx, dy);
-                    q.to = move(q.to, a, b, c, d, dx, dy);
-                },
-                .close => {},
-            }
-        }
+        };
+        const matrix: Matrix = .{ .a = a, .b = b, .c = c, .d = d, .dx = dx, .dy = dy };
+        for (self.commands.items) |*command| command.* = command.map(matrix, Matrix.point);
     }
 
     /// Add every command of `other` to this outline, unchanged. What a
@@ -290,6 +318,20 @@ pub const Builder = struct {
             self.at = between;
         }
         self.pending = control;
+    }
+
+    /// A cubic curve, both control points given at once.
+    ///
+    /// The PostScript form. Nothing is implied and nothing is held back: a
+    /// charstring names both controls and the endpoint in one operator, so
+    /// there is no `pending` to resolve - which is why this is one line and
+    /// `controlAt` is not.
+    pub fn cubicTo(self: *Builder, control1: Point, control2: Point, point: Point) Allocator.Error!void {
+        try self.flushPending(control1);
+        try self.outline.commands.append(self.gpa, .{
+            .cubic = .{ .control1 = control1, .control2 = control2, .to = point },
+        });
+        self.at = point;
     }
 
     /// An on-curve point, using whatever control point is waiting.
@@ -457,6 +499,29 @@ test "a transform moves and scales every point" {
     try testing.expectEqual(Point.init(100, 50), outline.commands.items[0].move);
     try testing.expectEqual(Point.init(105, 40), outline.commands.items[1].quadratic.control);
     try testing.expectEqual(Point.init(110, 50), outline.commands.items[1].quadratic.to);
+}
+
+test "a cubic keeps both control points through bounds and a transform" {
+    var outline: Outline = .{};
+    defer outline.deinit(testing.allocator);
+
+    var builder: Builder = .init(testing.allocator, &outline);
+    try builder.moveTo(.init(0, 0));
+    try builder.cubicTo(.init(10, 30), .init(30, 30), .init(40, 0));
+    try builder.close();
+
+    try testing.expectEqual(Command.cubic, std.meta.activeTag(outline.commands.items[1]));
+    // Generous again: the curve itself peaks at y = 22.5.
+    try testing.expectEqual(@as(f32, 30), outline.bounds().max_y);
+
+    outline.transform(2, -1, 0, 100);
+    const curve = outline.commands.items[1].cubic;
+    try testing.expectEqual(Point.init(20, 70), curve.control1);
+    try testing.expectEqual(Point.init(60, 70), curve.control2);
+    try testing.expectEqual(Point.init(80, 100), curve.to);
+
+    outline.affine(0, 1, 1, 0, 0, 0); // swap x and y
+    try testing.expectEqual(Point.init(100, 80), outline.commands.items[1].cubic.to);
 }
 
 test "clearing keeps the memory for the next glyph" {

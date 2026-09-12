@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: BSD-2-Clause
 
-//! Fluxion Font - a TrueType file, and the pixels it describes.
+//! Fluxion Font - a TrueType or OpenType file, and the pixels it describes.
 //!
-//! `Font` is the front door, and the six modules under it are there for a
+//! `Font` is the front door, and the seven modules under it are there for a
 //! caller that wants a part rather than the whole:
 //!
 //!   `Font`     a font opened: the tables parsed, and what a renderer asks
@@ -10,8 +10,9 @@
 //!   `tables`   the ones every font has - `head`, `hhea`, `maxp`, `OS/2`,
 //!              `hmtx` - read into structs
 //!   `cmap`     a character to the glyph that draws it
-//!   `glyf`     a glyph to its outline, composites included
-//!   `outline`  the shape itself: contours of lines and quadratic curves
+//!   `glyf`     a TrueType glyph to its outline, composites included
+//!   `cff`      a PostScript glyph to its outline, by running its charstring
+//!   `outline`  the shape itself: contours of lines and curves
 //!   `raster`   the outline to coverage, with the edges smoothed
 //!
 //! ```zig
@@ -37,10 +38,12 @@
 //! ligatures and marks in the right places is a much larger library than this
 //! one. What this does is the part underneath both: bytes in, coverage out.
 //!
-//! **TrueType outlines only.** A `CFF ` table holds PostScript outlines, which
-//! are cubic and a different format entirely; a font that has one and no
-//! `glyf` is refused rather than half-read. Every font shipped with Windows,
-//! macOS and the usual open families has `glyf`.
+//! **Both kinds of outline.** A TrueType font keeps its shapes as rings of
+//! points in `glyf`; a PostScript-flavoured OpenType font keeps them as
+//! charstrings in `CFF `, small programs that `cff` runs. Both come out as an
+//! `Outline` and nothing above that layer can tell which it was given, which
+//! is what lets a `.otf` bought from a foundry and a `.ttf` off the system
+//! be the same type here. `CFF2`, the variable-font form, is not read.
 //!
 //! **Nothing here trusts the file.** Every offset is checked against the
 //! length it points into before it is followed, because a font is a file that
@@ -60,12 +63,17 @@ pub const sfnt = @import("sfnt.zig");
 pub const tables = @import("tables.zig");
 pub const cmap = @import("cmap.zig");
 pub const glyf = @import("glyf.zig");
+pub const cff = @import("cff.zig");
 pub const outline = @import("outline.zig");
 pub const raster = @import("raster.zig");
 
 /// A font at one size: measuring, line height, and the scale to render at.
 /// See `Font.at`.
 pub const Scaled = Font.Scaled;
+
+/// Whichever outline table a font has, behind one `outlineOf`. See
+/// `Font.Outlines`.
+pub const Outlines = Font.Outlines;
 
 /// A glyph rasterised, with where it sits relative to the pen. See
 /// `Font.render`.
@@ -92,6 +100,7 @@ test {
     _ = tables;
     _ = cmap;
     _ = glyf;
+    _ = cff;
     _ = outline;
     _ = raster;
 }

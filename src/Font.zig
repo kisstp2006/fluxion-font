@@ -2,9 +2,11 @@
 
 //! A font, opened: the tables parsed, and everything a renderer asks of it.
 //!
-//! The front door. The six modules under it read one thing each and are there
-//! for a caller that wants a part - a tool that lists tables, a validator that
-//! walks every glyph. This is the whole, and it is what a renderer holds.
+//! The front door. The seven modules under it read one thing each and are
+//! there for a caller that wants a part - a tool that lists tables, a
+//! validator that walks every glyph. This is the whole, and it is what a
+//! renderer holds. A TrueType font and a PostScript one open the same way and
+//! answer the same questions; which kind it was is `Outlines`' business.
 //!
 //! ```zig
 //! var font: Font = try .init(bytes);
@@ -41,6 +43,7 @@ const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
 
+const cff = @import("cff.zig");
 const cmap = @import("cmap.zig");
 const glyf = @import("glyf.zig");
 const outline = @import("outline.zig");
@@ -53,12 +56,7 @@ const View = sfnt.View;
 
 const Font = @This();
 
-pub const Error = sfnt.Error || Allocator.Error || error{
-    /// The font has PostScript outlines in a `CFF ` table rather than
-    /// TrueType ones in `glyf`. Its metrics and character map are readable;
-    /// its shapes are not, by this library.
-    PostScriptOutlines,
-};
+pub const Error = sfnt.Error || Allocator.Error;
 
 file: sfnt.File,
 head: tables.Head,
@@ -69,21 +67,48 @@ maxp: tables.Maxp,
 os2: ?tables.Os2,
 hmtx: tables.Hmtx,
 characters: cmap.Cmap,
-outlines: glyf.Glyf,
+outlines: Outlines,
 /// The `kern` table, if the font has one.
 kerning: ?View,
+
+/// Where the shapes are: `glyf` for a TrueType font, `CFF ` for a
+/// PostScript one.
+///
+/// A tagged union, because the two are different formats with different
+/// readers and a font has exactly one of them. Everything above this point
+/// asks for an outline and gets one, and the only place that knows which
+/// kind of font it is holding is the `switch` in `outlineOf` - which is
+/// what a tagged union is for, and why it is not two optional fields that
+/// every caller would have to check.
+pub const Outlines = union(enum) {
+    truetype: glyf.Glyf,
+    postscript: cff.Cff,
+
+    /// Find whichever table the font has. `glyf` wins if both are there,
+    /// which no real font does and the specification does not allow.
+    pub fn read(file: sfnt.File) Error!Outlines {
+        if (try file.table(.glyf) != null) return .{ .truetype = try .read(file) };
+        if (try file.table(.cff) != null) return .{ .postscript = try .read(file) };
+        return error.MissingTable;
+    }
+
+    /// Read a glyph's shape into `out`, in font units, whichever kind it is.
+    ///
+    /// `inline else` is the union being switched on once for every tag at
+    /// compile time: the body is instantiated per variant with `table` as
+    /// the concrete type, so the call resolves statically and nothing is
+    /// dispatched through a pointer. It reads as one line because the two
+    /// readers were given the same method on purpose.
+    pub fn outlineOf(self: Outlines, gpa: Allocator, glyph: u16, out: *Outline) Error!void {
+        switch (self) {
+            inline else => |table| try table.outlineOf(gpa, glyph, out),
+        }
+    }
+};
 
 /// Open a font.
 pub fn init(bytes: []const u8) Error!Font {
     const file = try sfnt.File.init(bytes);
-
-    // Said clearly and early. Every other table in a PostScript font reads
-    // perfectly well, so without this the failure would come at the first
-    // glyph as a missing `glyf`, which says nothing about the real problem.
-    if (try file.table(.glyf) == null and file.isPostScript()) {
-        return error.PostScriptOutlines;
-    }
-
     return .{
         .file = file,
         .head = try tables.Head.read(file),
@@ -92,9 +117,16 @@ pub fn init(bytes: []const u8) Error!Font {
         .os2 = try tables.Os2.read(file),
         .hmtx = try tables.Hmtx.read(file),
         .characters = try cmap.Cmap.read(file),
-        .outlines = try glyf.Glyf.read(file),
+        .outlines = try Outlines.read(file),
         .kerning = try file.table(.kern),
     };
+}
+
+/// Whether the shapes are PostScript charstrings rather than TrueType
+/// contours. Nothing above this layer needs to know; a tool that reports on
+/// a font might.
+pub inline fn isPostScript(self: Font) bool {
+    return self.outlines == .postscript;
 }
 
 /// How many glyphs the font has.
@@ -461,18 +493,51 @@ test "kerning is a small number of font units, or nothing at all" {
     if (font.kerning == null) try testing.expectEqual(0, value);
 }
 
-test "a font with PostScript outlines says so, rather than failing at the first glyph" {
-    var head: [54]u8 = @splat(0);
-    std.mem.writeInt(u32, head[12..16], 0x5F0F3CF5, .big);
-    std.mem.writeInt(u16, head[18..20], 1000, .big);
+/// A PostScript-flavoured OpenType font from the system, or null. Windows
+/// ships a handful of `.otf` files with its Hebrew fonts; a Linux box with
+/// the Adobe or Noto CJK fonts installed has them by the dozen.
+fn systemPostScriptFont(gpa: Allocator) !?[]u8 {
+    const candidates = [_][]const u8{
+        "C:/Windows/Fonts/FrankRuhlHofshi-Regular.otf",
+        "C:/Windows/Fonts/DavidCLM-Medium.otf",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/OTF/SourceSans3-Regular.otf",
+    };
+    for (candidates) |path| {
+        return std.Io.Dir.cwd().readFileAlloc(testing.io, path, gpa, .limited(32 << 20)) catch continue;
+    }
+    return null;
+}
 
-    const bytes = try sfnt.buildTestFont(testing.allocator, &.{
-        .{ .tag = "CFF ", .body = &.{ 1, 0, 4, 4 } },
-        .{ .tag = "head", .body = &head },
-    });
+test "a PostScript font opens the same way and draws the same letters" {
+    const bytes = try systemPostScriptFont(testing.allocator) orelse return error.SkipZigTest;
     defer testing.allocator.free(bytes);
 
-    try testing.expectError(error.PostScriptOutlines, Font.init(bytes));
+    const font: Font = try .init(bytes);
+    try testing.expect(font.isPostScript());
+
+    // The metrics are the same tables whichever kind of outline the font
+    // has, so the scaled questions answer the same way.
+    const text = font.at(16);
+    try testing.expect(text.ascent() > 0);
+    try testing.expect(try text.measure("Hello") > try text.measure("Hell"));
+
+    // And a capital comes out as ink where a capital has it.
+    var glyph = try font.render(testing.allocator, font.glyphFor('H'), font.scaleFor(64));
+    defer glyph.deinit(testing.allocator);
+    try testing.expect(!glyph.bitmap.isEmpty());
+    try testing.expect(glyph.top > 0);
+
+    // The shapes are cubics, which is what says the charstrings were run
+    // rather than a `glyf` table found by accident.
+    var shape: Outline = .empty;
+    defer shape.deinit(testing.allocator);
+    try font.outlineOf(testing.allocator, font.glyphFor('o'), &shape);
+    var cubics: usize = 0;
+    for (shape.commands.items) |command| {
+        if (command == .cubic) cubics += 1;
+    }
+    try testing.expect(cubics > 0);
 }
 
 test "a font missing a table it cannot do without says so" {
