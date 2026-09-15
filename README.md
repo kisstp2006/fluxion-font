@@ -135,7 +135,9 @@ Read and tested:
   DICT per font dict, which is what every CJK OpenType font is
 - Character maps in formats 0, 4, 6 and 12, including the Windows Symbol shift
 - `head`, `hhea`, `hmtx`, `maxp`, `OS/2`, and `kern` in format 0
-- TrueType collections (`.ttc`), one font at a time
+- TrueType collections (`.ttc`), one font at a time: `Font.initMember(bytes,
+  index)`, which takes the file and the place in it that a system's font
+  lookup hands back, and index nought of a file that is one font
 - Antialiased rasterising, metrics, and string measurement with kerning
 
 Not here, and each for a reason:

@@ -106,9 +106,29 @@ pub const Outlines = union(enum) {
     }
 };
 
-/// Open a font.
+/// Open a font. A collection is `error.IsACollection`: which of its fonts is
+/// meant is `initMember`'s to be told.
 pub fn init(bytes: []const u8) Error!Font {
-    const file = try sfnt.File.init(bytes);
+    return open(try sfnt.File.init(bytes));
+}
+
+/// Open the `index`th font of a TrueType collection - a `.ttc`, which is what
+/// Windows ships its Chinese, Japanese and Korean interface fonts in - or,
+/// at nought, a file that is one font and not a collection at all.
+///
+/// What a system's font lookup hands back is a file and a place in it, and
+/// this takes both, so a caller need not ask which kind of file it was.
+pub fn initMember(bytes: []const u8, index: u32) Error!Font {
+    const file = sfnt.File.init(bytes) catch |err| switch (err) {
+        error.IsACollection => return open(try sfnt.File.collectionMember(bytes, index)),
+        else => return err,
+    };
+    // A file that is one font has one member, and it is the first.
+    if (index != 0) return error.OutOfBounds;
+    return open(file);
+}
+
+fn open(file: sfnt.File) Error!Font {
     return .{
         .file = file,
         .head = try tables.Head.read(file),
@@ -408,6 +428,54 @@ fn systemFont(gpa: Allocator) !?[]u8 {
         return std.Io.Dir.cwd().readFileAlloc(testing.io, path, gpa, .limited(32 << 20)) catch continue;
     }
     return null;
+}
+
+/// A TrueType collection from the system, or null: Yu Gothic beside Yu Gothic
+/// UI on Windows, Cambria beside Cambria Math, and the Noto CJK fonts on a
+/// Linux box that has them.
+fn systemCollection(gpa: Allocator) !?[]u8 {
+    const candidates = [_][]const u8{
+        "C:/Windows/Fonts/YuGothM.ttc",
+        "C:/Windows/Fonts/cambria.ttc",
+        "C:/Windows/Fonts/msgothic.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+        "/System/Library/Fonts/Helvetica.ttc",
+    };
+    for (candidates) |path| {
+        return std.Io.Dir.cwd().readFileAlloc(testing.io, path, gpa, .limited(64 << 20)) catch continue;
+    }
+    return null;
+}
+
+test "a font out of a collection opens by its place in the file" {
+    const bytes = try systemCollection(testing.allocator) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+
+    try testing.expectError(error.IsACollection, init(bytes));
+    const count = try sfnt.File.collectionCount(bytes);
+    try testing.expect(count >= 2);
+
+    // Two fonts sharing one file: each is a whole font, at a directory of
+    // its own, and each draws the letters.
+    const first = try initMember(bytes, 0);
+    const second = try initMember(bytes, 1);
+    try testing.expect(first.file.directory_at != second.file.directory_at);
+    try testing.expect(first.has('A') and second.has('A'));
+    try testing.expect(try first.at(16).measure("Hello") > 0);
+
+    try testing.expectError(error.OutOfBounds, initMember(bytes, count));
+}
+
+test "a font that is not a collection is its own only member" {
+    const bytes = try systemFont(testing.allocator) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+
+    const whole = try init(bytes);
+    const member = try initMember(bytes, 0);
+    try testing.expectEqual(whole.glyphCount(), member.glyphCount());
+    try testing.expectEqual(whole.glyphFor('A'), member.glyphFor('A'));
+    try testing.expectError(error.OutOfBounds, initMember(bytes, 1));
 }
 
 test "measuring a string is more than adding up the letters" {
