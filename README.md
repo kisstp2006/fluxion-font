@@ -13,6 +13,12 @@ dependencies.
 | `cff` | A PostScript glyph to its outline, by running its charstring. |
 | `outline` | The shape itself: closed contours of lines and curves, quadratic or cubic. |
 | `raster` | The outline to coverage, with the edges smoothed. |
+| `colr` | A colour glyph - `COLR` layers or paints, `CPAL` colours - to RGBA. |
+| `cbdt` | A colour glyph kept as a picture (`CBLC`, `CBDT`): its PNG and where it sits. |
+| `gsub` | The `GSUB` substitutions that put an emoji sequence together. |
+| `layout` | The coverage and class tables `gsub` is built on. |
+| `emoji` | Where one emoji's characters end: selectors, skin tones, joiners, flags, keycaps. |
+| `fallback` | Which of several fonts draws each part of a run of text. |
 
 ```zig
 const font = @import("fluxion_font");
@@ -39,8 +45,44 @@ paragraph if you tell it how big the text is; nothing could tell it that
 either. This is what answers both, and it draws the glyphs afterwards.
 
 **Bytes in, coverage out.** It reads a font; it does not choose one. There is
-no fallback chain and no system font directory - which file to open is the
-program's business.
+no system font directory - which file to open is the program's business.
+Given the fonts to fall back on, `fallback` says which of them draws each
+emoji and each character the text's own font lacks.
+
+## Emoji
+
+An emoji font is read like any other and drawn in colour:
+
+```zig
+var text_face: font.Font = try .init(text_bytes);
+var emoji_face: font.Font = try .init(emoji_bytes);  // seguiemj.ttf, NotoColorEmoji.ttf
+const faces = [_]*const font.Font{ &text_face, &emoji_face };
+
+var glyphs: font.fallback.Glyphs = .init(&faces, "Hi 👋🏽 👨‍👩‍👧");
+while (glyphs.next()) |placed| {
+    const face = faces[placed.face];
+    if (face.hasColor(placed.glyph)) {
+        var picture = (try face.renderColor(gpa, placed.glyph, 32, .{ .decode_png = decode })).?;
+        defer picture.deinit(gpa);
+        // picture.pixels: straight RGBA, picture.left/top/advance as `render`
+    }
+}
+```
+
+- **Which font:** a cluster that wants to be an emoji - one that is emoji
+  unless asked otherwise, or has a selector, a skin tone, a joiner or a
+  keycap after it, or is a flag - goes to the first fallback that has it;
+  anything else stays in its own font until that font lacks it.
+- **Sequences:** the font's `ccmp` substitutions run over the cluster, which
+  is how a family, a flag or a skin tone becomes the glyph the font drew for
+  it. A joiner or a selector the font draws nothing for is dropped.
+- **Colour:** `COLR` version 0 (layers, each one colour) and version 1 (a
+  tree of paints: solid, linear, radial and sweep gradients, transforms,
+  blend modes), drawn in premultiplied floating point; `CBDT` pictures,
+  scaled with an area filter. The PNG decoding is the caller's, through
+  `ColorOptions.decode_png`, so this stays free of dependencies.
+- **Edges:** a transparent pixel of a colour glyph carries the colour beside
+  it, so a filtered sample at the edge does not darken.
 
 ## Install
 
@@ -139,6 +181,11 @@ Read and tested:
   index)`, which takes the file and the place in it that a system's font
   lookup hands back, and index nought of a file that is one font
 - Antialiased rasterising, metrics, and string measurement with kerning
+- Colour glyphs: `COLR` versions 0 and 1 with `CPAL`, and `CBLC`/`CBDT`
+  pictures; a font of pictures and nothing else opens too
+- `GSUB` single, multiple and ligature substitution, contextual and chained
+  contextual in all three formats, and extensions - for an emoji cluster
+- Emoji clusters, and choosing between a text's own font and its fallbacks
 
 Not here, and each for a reason:
 
@@ -146,7 +193,8 @@ Not here, and each for a reason:
 | --- | --- |
 | **`CFF2` and variable fonts** | The variable form of both outline formats blends several sets of coordinates by an axis position, and `CFF2` has a different header and DICT-less layout to go with it. A static instance of any variable font reads fine; the variation itself is a second library. |
 | **Hinting** | A bytecode stack machine with about eighty instructions, whose result is only visible below fourteen pixels on a display that is not high-density. A good antialiased rasteriser instead is the trade every modern text stack has made. |
-| **Shaping** | Ligatures, marks and reordering need `GSUB` and `GPOS`, which are their own library. One glyph per codepoint plus `kern` pairs is correct for Latin, Greek, Cyrillic and CJK. |
+| **Shaping** | Ligatures, marks and reordering need `GSUB` and `GPOS` run over whole runs, which is its own library. One glyph per codepoint plus `kern` pairs is correct for Latin, Greek, Cyrillic and CJK; `GSUB` is run only over an emoji cluster, and a lookup's flags are not read. |
+| **`sbix`, `SVG ` and variable colour** | Apple's picture table and SVG glyphs are other formats again; a `Var` paint is drawn at its default values. |
 | **A glyph atlas** | Packing rasterised glyphs into one texture belongs with whatever owns the texture. This hands you the coverage. |
 
 ## Examples

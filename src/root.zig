@@ -2,7 +2,7 @@
 
 //! Fluxion Font - a TrueType or OpenType file, and the pixels it describes.
 //!
-//! `Font` is the front door, and the seven modules under it are there for a
+//! `Font` is the front door, and the modules under it are there for a
 //! caller that wants a part rather than the whole:
 //!
 //!   `Font`     a font opened: the tables parsed, and what a renderer asks
@@ -14,6 +14,12 @@
 //!   `cff`      a PostScript glyph to its outline, by running its charstring
 //!   `outline`  the shape itself: contours of lines and curves
 //!   `raster`   the outline to coverage, with the edges smoothed
+//!   `colr`     a colour glyph from layers or paints, to RGBA
+//!   `cbdt`     a colour glyph kept as a picture
+//!   `gsub`     the substitutions that put an emoji sequence together
+//!   `layout`   the coverage and class tables `gsub` is built on
+//!   `emoji`    where one emoji's characters end
+//!   `fallback` which of several fonts draws each part of a run of text
 //!
 //! ```zig
 //! const fonts = @import("fluxion_font");
@@ -32,11 +38,14 @@
 //! makes opening one nearly free, and why `@embedFile` is the usual way to
 //! carry one.
 //!
-//! **It reads a font; it does not choose one.** There is no fallback chain, no
-//! system font directory and no shaping. Which file to open is the program's
-//! business, and turning a run of text into a sequence of glyphs with
-//! ligatures and marks in the right places is a much larger library than this
-//! one. What this does is the part underneath both: bytes in, coverage out.
+//! **It reads a font; it does not choose one.** There is no system font
+//! directory and no shaping. Which file to open is the program's business,
+//! and turning a run of text into a sequence of glyphs with ligatures and
+//! marks in the right places is a much larger library than this one. What
+//! this does is the part underneath both: bytes in, coverage out. Given the
+//! fonts to fall back on, `fallback` says which of them draws each emoji and
+//! each character the text's own font lacks - choosing between them, never
+//! looking for one.
 //!
 //! **Both kinds of outline.** A TrueType font keeps its shapes as rings of
 //! points in `glyf`; a PostScript-flavoured OpenType font keeps them as
@@ -66,6 +75,12 @@ pub const glyf = @import("glyf.zig");
 pub const cff = @import("cff.zig");
 pub const outline = @import("outline.zig");
 pub const raster = @import("raster.zig");
+pub const colr = @import("colr.zig");
+pub const cbdt = @import("cbdt.zig");
+pub const gsub = @import("gsub.zig");
+pub const layout = @import("layout.zig");
+pub const emoji = @import("emoji.zig");
+pub const fallback = @import("fallback.zig");
 
 /// A font at one size: measuring, line height, and the scale to render at.
 /// See `Font.at`.
@@ -94,6 +109,11 @@ pub const Placement = raster.Placement;
 /// The glyph a font draws for a character it has nothing for. See `cmap`.
 pub const notdef = cmap.notdef;
 
+/// A colour glyph drawn, and what `Font.renderColor` is told. See `Font`.
+pub const Colored = Font.Colored;
+pub const ColorOptions = Font.ColorOptions;
+pub const Decoded = Font.Decoded;
+
 test {
     _ = Font;
     _ = sfnt;
@@ -103,4 +123,10 @@ test {
     _ = cff;
     _ = outline;
     _ = raster;
+    _ = colr;
+    _ = cbdt;
+    _ = gsub;
+    _ = layout;
+    _ = emoji;
+    _ = fallback;
 }
