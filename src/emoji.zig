@@ -106,7 +106,7 @@ pub fn clusterStart(text: []const u8, end: usize) usize {
     var steps: usize = 0;
     while (from > 0 and steps < 64) : (steps += 1) {
         from -= 1;
-        while (from > 0 and text[from] & 0xC0 == 0x80) from -= 1;
+        from = characterStart(text, from);
         if (!isContinuation(text, from)) break;
     }
     var at = from;
@@ -118,13 +118,23 @@ pub fn clusterStart(text: []const u8, end: usize) usize {
     return start;
 }
 
+/// The first byte of the character `at` is in: back over at most three
+/// continuation bytes, which is the most one character has - so a run of
+/// stray ones is a character each, the way `decode` reads them going forward.
+fn characterStart(text: []const u8, at: usize) usize {
+    var i = at;
+    var steps: usize = 0;
+    while (i > 0 and steps < 3 and text[i] & 0xC0 == 0x80) : (steps += 1) i -= 1;
+    return if (text[i] & 0xC0 == 0x80) at else i;
+}
+
 /// Whether the character at `at` belongs to the one before it.
 fn isContinuation(text: []const u8, at: usize) bool {
     const here = decode(text, at).cp;
     if (extends(here) or here == zero_width_joiner) return true;
     if (at == 0) return false;
     var before = at - 1;
-    while (before > 0 and text[before] & 0xC0 == 0x80) before -= 1;
+    before = characterStart(text, before);
     const previous = decode(text, before).cp;
     // After a joiner, and the second of a pair of regional letters - which
     // only counting from the start of the run of them can say, so any
@@ -202,6 +212,13 @@ test "a cluster ends where it ends whichever side it is found from" {
         at = end;
     }
     try testing.expectEqual(@as(usize, 0), clusterStart(text, 0));
+}
+
+test "stray continuation bytes are a character each, both ways" {
+    const broken = [_]u8{0x80} ** 1000;
+    try testing.expectEqual(@as(usize, 1), clusterEnd(&broken, 0));
+    try testing.expectEqual(@as(usize, 999), clusterStart(&broken, 1000));
+    try testing.expectEqual(@as(usize, 0), clusterStart(&broken, 1));
 }
 
 test "a joiner at the end stays with what it follows" {
