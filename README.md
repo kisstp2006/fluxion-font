@@ -16,7 +16,8 @@ dependencies.
 | `colr` | A colour glyph - `COLR` layers or paints, `CPAL` colours - to RGBA. |
 | `cbdt` | A colour glyph kept as a picture (`CBLC`, `CBDT`): its PNG and where it sits. |
 | `gsub` | The `GSUB` substitutions that put an emoji sequence together. |
-| `layout` | The coverage and class tables `gsub` is built on. |
+| `gpos` | The `GPOS` pair adjustments a modern font keeps its kerning in, found once when the font opens. |
+| `layout` | The coverage and class tables `gsub` and `gpos` are built on. |
 | `emoji` | Where one emoji's characters end: selectors, skin tones, joiners, flags, keycaps. |
 | `fallback` | Which of several fonts draws each part of a run of text. |
 
@@ -177,6 +178,11 @@ Read and tested:
   DICT per font dict, which is what every CJK OpenType font is
 - Character maps in formats 0, 4, 6 and 12, including the Windows Symbol shift
 - `head`, `hhea`, `hmtx`, `maxp`, `OS/2`, and `kern` in format 0
+- Kerning from `GPOS`: the pair adjustments (lookup type 2, pair lists and
+  class grids, inside extensions or not) that the `kern` feature names,
+  resolved when the font opens so `Font.kern` is a few coverage searches.
+  A font that kerns there - Inter has no `kern` table at all - is kerned
+  from it, and one that does not falls back to `kern`; never both
 - TrueType collections (`.ttc`), one font at a time: `Font.initMember(bytes,
   index)`, which takes the file and the place in it that a system's font
   lookup hands back, and index nought of a file that is one font
@@ -193,7 +199,7 @@ Not here, and each for a reason:
 | --- | --- |
 | **`CFF2` and variable fonts** | The variable form of both outline formats blends several sets of coordinates by an axis position, and `CFF2` has a different header and DICT-less layout to go with it. A static instance of any variable font reads fine; the variation itself is a second library. |
 | **Hinting** | A bytecode stack machine with about eighty instructions, whose result is only visible below fourteen pixels on a display that is not high-density. A good antialiased rasteriser instead is the trade every modern text stack has made. |
-| **Shaping** | Ligatures, marks and reordering need `GSUB` and `GPOS` run over whole runs, which is its own library. One glyph per codepoint plus `kern` pairs is correct for Latin, Greek, Cyrillic and CJK; `GSUB` is run only over an emoji cluster, and a lookup's flags are not read. |
+| **Shaping** | Ligatures, marks and reordering need the whole of `GSUB` and `GPOS` run over whole runs, which is its own library. One glyph per codepoint plus pair kerning is correct for Latin, Greek, Cyrillic and CJK. Of `GPOS`, only pair kerning is read, and of a pair only the first glyph's horizontal advance: marks are not placed on their bases, and cursive attachment and contextual kerning are not applied. The `kern` lookups of every script are taken together, since a pair comes without its script. `GSUB` is run only over an emoji cluster, and a lookup's flags are not read by either. |
 | **`sbix`, `SVG ` and variable colour** | Apple's picture table and SVG glyphs are other formats again; a `Var` paint is drawn at its default values. |
 | **A glyph atlas** | Packing rasterised glyphs into one texture belongs with whatever owns the texture. This hands you the coverage. |
 

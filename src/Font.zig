@@ -34,12 +34,15 @@
 //! is the trade every modern text stack has made.
 //!
 //! **No shaping.** Turning a string into positioned glyphs in Arabic,
-//! Devanagari or any script with ligatures needs `GSUB` and `GPOS`, which are
-//! their own library. What is here is one glyph per codepoint plus `kern`
-//! pairs - correct for Latin, Greek, Cyrillic and CJK, and what a UI needs
-//! before it needs anything else. The one exception is an emoji sequence:
-//! `substitute` runs a font's `GSUB` over a cluster, which is what an emoji
-//! font needs to put a family or a flag together. See `fallback`.
+//! Devanagari or any script with ligatures needs the whole of `GSUB` and
+//! `GPOS` run over whole runs of text, which is its own library. What is
+//! here is one glyph per codepoint plus pair kerning - from `GPOS` where the
+//! font keeps it, which is where a modern font does, and from `kern` where
+//! it does not. That is correct for Latin, Greek, Cyrillic and CJK, and what
+//! a UI needs before it needs anything else; what it leaves out is a mark
+//! placed on the letter it belongs to. The one exception is an emoji
+//! sequence: `substitute` runs a font's `GSUB` over a cluster, which is what
+//! an emoji font needs to put a family or a flag together. See `fallback`.
 //!
 //! **Colour glyphs.** An emoji font draws in colour, from layered outlines
 //! (`COLR` and `CPAL`, see `colr`) or from pictures (`CBDT`, see `cbdt`).
@@ -55,6 +58,7 @@ const cff = @import("cff.zig");
 const cmap = @import("cmap.zig");
 const colr = @import("colr.zig");
 const glyf = @import("glyf.zig");
+const gpos = @import("gpos.zig");
 const gsub_table = @import("gsub.zig");
 const outline = @import("outline.zig");
 const raster = @import("raster.zig");
@@ -80,7 +84,11 @@ characters: cmap.Cmap,
 /// Null only for a font of pictures and nothing else - a `CBDT` emoji font
 /// with no outlines at all.
 outlines: ?Outlines,
-/// The `kern` table, if the font has one.
+/// The pair kerning in `GPOS`, found when the font was opened, if it has
+/// any. When it is there, `kern` reads it and not `kerning`.
+pairs: ?gpos.Kerning,
+/// The `kern` table, if the font has one. What `kern` reads when `pairs` is
+/// null.
 kerning: ?View,
 /// Colour glyphs: layers or paints, their palette, and pictures.
 colors: ?colr.Colr,
@@ -161,6 +169,9 @@ fn open(file: sfnt.File) Error!Font {
             error.MissingTable => if (bitmaps != null) null else return err,
             else => return err,
         },
+        // Never an error: a `GPOS` too broken to walk is no kerning, and
+        // the font opens without it. See `gpos`.
+        .pairs = gpos.Kerning.read(file),
         .kerning = try file.table(.kern),
         .colors = try colr.Colr.read(file),
         .palette = try colr.Palette.read(file),
@@ -217,11 +228,24 @@ pub inline fn advance(self: Font, glyph: u16) Error!u16 {
 /// them, in font units. Negative for the pairs that need it - `AV`, `To`,
 /// `Yo` - and zero for everything else, which is almost every pair.
 ///
-/// Only the `kern` table, in format 0. Modern fonts put their kerning in
-/// `GPOS` instead, which needs a shaping engine to read; a font with only
-/// `GPOS` answers zero here and sets text that looks slightly loose rather
-/// than wrong.
+/// From `GPOS` when the font kerns there, which nearly every font made in
+/// the last fifteen years does and Inter does exclusively: the pair
+/// adjustments its `kern` feature names, found once when the font was
+/// opened, so a call here is a few coverage searches and nothing else. See
+/// `gpos`. Otherwise from the `kern` table, in format 0, which is where an
+/// older font keeps it.
+///
+/// **Never from both.** A font with both carries `kern` for software that
+/// cannot read `GPOS`, and the two say much the same thing - adding them
+/// would kern every pair twice. `GPOS` wins, which is the rule HarfBuzz follows
+/// too. A font whose `GPOS` has no pair kerning this can read - none at all,
+/// or only the contextual kind - falls back to its `kern` table, which is
+/// the designer's own approximation and better than nothing.
+///
+/// The error is the `kern` table's. The `GPOS` side has none to give: a pair
+/// whose subtable cannot be read is a pair that is not kerned.
 pub fn kern(self: Font, left: u16, right: u16) Error!i16 {
+    if (self.pairs) |*pairs| return pairs.kern(left, right);
     const table = self.kerning orelse return 0;
     if (table.len() < 4) return 0;
 
@@ -714,8 +738,197 @@ test "kerning is a small number of font units, or nothing at all" {
     const limit: i32 = font.head.units_per_em;
     try testing.expect(@as(i32, value) > -limit and @as(i32, value) < limit);
 
-    // And a font with no `kern` table answers zero rather than failing.
-    if (font.kerning == null) try testing.expectEqual(0, value);
+    // And a font with no kerning at all answers zero rather than failing.
+    if (font.kerning == null and font.pairs == null) try testing.expectEqual(0, value);
+}
+
+/// Inter from the system, by weight, or null. It keeps all of its kerning in
+/// `GPOS` and has no `kern` table, which is what makes it the font to check
+/// that `GPOS` is read.
+fn systemInter(gpa: Allocator, comptime weight: []const u8) !?[]u8 {
+    const candidates = [_][]const u8{
+        "/usr/share/fonts/rsms-inter-fonts/Inter-" ++ weight ++ ".ttf",
+        "/usr/share/fonts/inter/Inter-" ++ weight ++ ".ttf",
+        "/usr/share/fonts/truetype/inter/Inter-" ++ weight ++ ".ttf",
+        "/usr/share/fonts/opentype/inter/Inter-" ++ weight ++ ".otf",
+        "C:/Windows/Fonts/Inter-" ++ weight ++ ".ttf",
+    };
+    for (candidates) |path| {
+        return std.Io.Dir.cwd().readFileAlloc(testing.io, path, gpa, .limited(32 << 20)) catch continue;
+    }
+    return null;
+}
+
+test "Inter's kerning, which is only in GPOS, is read" {
+    var found = false;
+    inline for (.{ "Regular", "SemiBold" }) |weight| {
+        if (try systemInter(testing.allocator, weight)) |bytes| {
+            defer testing.allocator.free(bytes);
+            found = true;
+
+            const font: Font = try .init(bytes);
+            try testing.expect(font.pairs != null);
+
+            // The pairs everybody notices when they are not kerned.
+            for ([_]*const [2]u8{ "To", "AV", "Yo", "Ty", "VA" }) |pair| {
+                try testing.expect(try font.kern(font.glyphFor(pair[0]), font.glyphFor(pair[1])) < 0);
+            }
+            // And two straight stems are spaced by their sidebearings alone.
+            try testing.expectEqual(0, try font.kern(font.glyphFor('H'), font.glyphFor('H')));
+
+            // A measurement takes the kerning in: "AVATAR" is narrower than
+            // its letters' advances added up.
+            const text = font.at(16);
+            var letters: f32 = 0;
+            for ("AVATAR") |c| letters += try text.advanceOf(c);
+            try testing.expect(try text.measure("AVATAR") < letters - 1);
+        }
+    }
+    if (!found) return error.SkipZigTest;
+}
+
+/// A font with only what opening one needs, plus `extra`: twenty-seven
+/// glyphs of five hundred units on a thousand-unit em, `A` to `Z` drawn by
+/// glyphs 1 to 26, and no outlines. Built byte by byte so a test can give it
+/// exactly the kerning it is about.
+fn testFont(gpa: Allocator, extra: []const sfnt.TestTable) ![]u8 {
+    const glyphs = 27;
+
+    var head: [54]u8 = @splat(0);
+    std.mem.writeInt(u32, head[12..16], 0x5F0F3CF5, .big);
+    std.mem.writeInt(u16, head[18..20], 1000, .big);
+
+    var hhea: [36]u8 = @splat(0);
+    std.mem.writeInt(i16, hhea[4..6], 800, .big);
+    std.mem.writeInt(i16, hhea[6..8], -200, .big);
+    std.mem.writeInt(u16, hhea[34..36], glyphs, .big);
+
+    var maxp: [6]u8 = @splat(0);
+    std.mem.writeInt(u16, maxp[4..6], glyphs, .big);
+
+    var hmtx: [glyphs * 4]u8 = @splat(0);
+    for (0..glyphs) |g| std.mem.writeInt(u16, hmtx[g * 4 ..][0..2], 500, .big);
+
+    // One Windows Unicode subtable, in format 6: 26 characters from `A`.
+    var characters: [12 + 10 + 26 * 2]u8 = @splat(0);
+    std.mem.writeInt(u16, characters[2..4], 1, .big);
+    std.mem.writeInt(u16, characters[4..6], 3, .big);
+    std.mem.writeInt(u16, characters[6..8], 1, .big);
+    std.mem.writeInt(u32, characters[8..12], 12, .big);
+    std.mem.writeInt(u16, characters[12..14], 6, .big);
+    std.mem.writeInt(u16, characters[14..16], 10 + 26 * 2, .big);
+    std.mem.writeInt(u16, characters[18..20], 'A', .big);
+    std.mem.writeInt(u16, characters[20..22], 26, .big);
+    for (0..26) |k| std.mem.writeInt(u16, characters[22 + k * 2 ..][0..2], @intCast(k + 1), .big);
+
+    // Every glyph empty: a `loca` of zeros, over a `glyf` of nothing.
+    const loca: [(glyphs + 1) * 2]u8 = @splat(0);
+
+    var list: [16]sfnt.TestTable = undefined;
+    const required = [_]sfnt.TestTable{
+        .{ .tag = "head", .body = &head },
+        .{ .tag = "hhea", .body = &hhea },
+        .{ .tag = "maxp", .body = &maxp },
+        .{ .tag = "hmtx", .body = &hmtx },
+        .{ .tag = "cmap", .body = &characters },
+        .{ .tag = "loca", .body = &loca },
+        .{ .tag = "glyf", .body = &.{} },
+    };
+    @memcpy(list[0..required.len], &required);
+    @memcpy(list[required.len..][0..extra.len], extra);
+    return sfnt.buildTestFont(gpa, list[0 .. required.len + extra.len]);
+}
+
+/// A `kern` table in format 0 with one pair in it.
+fn testKern(left: u16, right: u16, value: i16) [24]u8 {
+    var bytes: [24]u8 = @splat(0);
+    std.mem.writeInt(u16, bytes[2..4], 1, .big); // one subtable
+    std.mem.writeInt(u16, bytes[6..8], 20, .big); // its length
+    std.mem.writeInt(u16, bytes[8..10], 0x0001, .big); // format 0, horizontal
+    std.mem.writeInt(u16, bytes[10..12], 1, .big); // one pair, after the search hints
+    std.mem.writeInt(u16, bytes[18..20], left, .big);
+    std.mem.writeInt(u16, bytes[20..22], right, .big);
+    std.mem.writeInt(i16, bytes[22..24], value, .big);
+    return bytes;
+}
+
+/// A `GPOS` that kerns `A` then `V` - glyphs 1 and 22 of `testFont` - by
+/// -80, and nothing else: one script, one `kern` feature, one lookup, one
+/// list of pairs. Each number is sixteen bits; the comments count in bytes.
+const test_gpos = gposBytes(&.{
+    1, 0, 10, 30, 44, // version 1.0, then the script, feature and lookup lists
+    1, 0x4446, 0x4C54, 8, // 10: one script, "DFLT", at +8
+    4, 0, // 18: its default language system at +4
+    0, 0xFFFF, 1, 0, // 22: no required feature, and feature 0
+    1, 0x6B65, 0x726E, 8, // 30: one feature, "kern", at +8
+    0, 1, 0, // 38: lookup 0
+    1, 4, // 44: one lookup, at +4
+    2, 0, 1, 8, // 48: a pair adjustment, one subtable at +8
+    1, 12, 0x0004, 0, 1, 18, // 56: a list of pairs, its coverage, an advance, one set
+    1, 1, 1, // 68: glyph 1 is covered
+    1, 22, -80, // 74: glyph 1 then glyph 22 moves by -80
+});
+
+fn gposBytes(comptime words: []const i32) [words.len * 2]u8 {
+    var out: [words.len * 2]u8 = undefined;
+    for (words, 0..) |word, k| {
+        std.mem.writeInt(u16, out[k * 2 ..][0..2], @truncate(@as(u32, @bitCast(word))), .big);
+    }
+    return out;
+}
+
+test "a font with no GPOS kerns from its kern table" {
+    const kerning = testKern(1, 22, -50);
+    const bytes = try testFont(testing.allocator, &.{.{ .tag = "kern", .body = &kerning }});
+    defer testing.allocator.free(bytes);
+
+    const font: Font = try .init(bytes);
+    try testing.expect(font.pairs == null);
+    try testing.expectEqual(-50, try font.kern(font.glyphFor('A'), font.glyphFor('V')));
+    try testing.expectEqual(0, try font.kern(font.glyphFor('V'), font.glyphFor('A')));
+
+    // At a thousand pixels to a thousand-unit em, a unit is a pixel: two
+    // advances of 500, less 50.
+    try testing.expectApproxEqAbs(@as(f32, 950), try font.at(1000).measure("AV"), 0.001);
+}
+
+test "a font that kerns in GPOS uses that, and not its kern table as well" {
+    const kerning = testKern(1, 22, -50);
+    const bytes = try testFont(testing.allocator, &.{
+        .{ .tag = "GPOS", .body = &test_gpos },
+        .{ .tag = "kern", .body = &kerning },
+    });
+    defer testing.allocator.free(bytes);
+
+    const font: Font = try .init(bytes);
+    try testing.expect(font.pairs != null);
+    // -80 from `GPOS`: not the `kern` table's -50, and not the two added.
+    try testing.expectEqual(-80, try font.kern(font.glyphFor('A'), font.glyphFor('V')));
+    try testing.expectEqual(0, try font.kern(font.glyphFor('A'), font.glyphFor('W')));
+    try testing.expectApproxEqAbs(@as(f32, 920), try font.at(1000).measure("AV"), 0.001);
+}
+
+test "a GPOS too broken to read falls back to the kern table, and opens" {
+    // The lookup list pointed past the end of the table.
+    var broken = test_gpos;
+    std.mem.writeInt(u16, broken[8..10], 0xFFF0, .big);
+    const kerning = testKern(1, 22, -50);
+
+    const with_kern = try testFont(testing.allocator, &.{
+        .{ .tag = "GPOS", .body = &broken },
+        .{ .tag = "kern", .body = &kerning },
+    });
+    defer testing.allocator.free(with_kern);
+    const font: Font = try .init(with_kern);
+    try testing.expect(font.pairs == null);
+    try testing.expectEqual(-50, try font.kern(font.glyphFor('A'), font.glyphFor('V')));
+
+    // With nothing to fall back on, nothing is kerned - and nothing fails.
+    const alone = try testFont(testing.allocator, &.{.{ .tag = "GPOS", .body = &broken }});
+    defer testing.allocator.free(alone);
+    const bare: Font = try .init(alone);
+    try testing.expectEqual(0, try bare.kern(bare.glyphFor('A'), bare.glyphFor('V')));
+    try testing.expectApproxEqAbs(@as(f32, 1000), try bare.at(1000).measure("AV"), 0.001);
 }
 
 /// A PostScript-flavoured OpenType font from the system, or null. Windows

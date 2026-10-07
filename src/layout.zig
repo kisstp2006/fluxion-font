@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: BSD-2-Clause
 
 //! The two lookups every OpenType layout table is built on: which glyphs a
-//! rule covers, and which class a glyph is in.
+//! rule covers, and which class a glyph is in. `gsub` substitutes with them
+//! and `gpos` kerns with them.
 //!
 //! `GSUB` - and `GPOS`, and `GDEF` - never list glyphs inline. A rule says
 //! "these glyphs" by pointing at a **coverage** table, and "glyphs of this
@@ -60,8 +61,11 @@ pub const Coverage = struct {
                     } else if (first > glyph) {
                         high = middle;
                     } else {
+                        // A range numbered from near the top runs past
+                        // 65535 in no font that works - only in one made
+                        // to crash a reader, so the cast is checked.
                         const start = try t.int(u16, at_ + 4);
-                        return @intCast(@as(u32, start) + glyph - first);
+                        return std.math.cast(u16, @as(u32, start) + glyph - first) orelse error.Malformed;
                     }
                 }
                 return null;
@@ -131,6 +135,14 @@ test "a coverage range counts on from where the range starts" {
     try testing.expectEqual(@as(?u16, 4), try coverage.index(14));
     try testing.expectEqual(@as(?u16, 11), try coverage.index(31));
     try testing.expectEqual(@as(?u16, null), try coverage.index(20));
+}
+
+test "a coverage range that counts past the last index is malformed, not a crash" {
+    // Glyphs 0 to 100, numbered from 65500: glyph 99 would be index 65599.
+    const ranges: View = .{ .bytes = &.{ 0, 2, 0, 1, 0, 0, 0, 100, 0xFF, 0xDC } };
+    const coverage: Coverage = .{ .table = ranges };
+    try testing.expectEqual(@as(?u16, 65535), try coverage.index(35));
+    try testing.expectError(error.Malformed, coverage.index(99));
 }
 
 test "a glyph a class table does not name is in class zero" {

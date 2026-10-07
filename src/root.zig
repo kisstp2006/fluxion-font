@@ -17,7 +17,8 @@
 //!   `colr`     a colour glyph from layers or paints, to RGBA
 //!   `cbdt`     a colour glyph kept as a picture
 //!   `gsub`     the substitutions that put an emoji sequence together
-//!   `layout`   the coverage and class tables `gsub` is built on
+//!   `gpos`     the pair adjustments a modern font keeps its kerning in
+//!   `layout`   the coverage and class tables `gsub` and `gpos` are built on
 //!   `emoji`    where one emoji's characters end
 //!   `fallback` which of several fonts draws each part of a run of text
 //!
@@ -78,6 +79,7 @@ pub const raster = @import("raster.zig");
 pub const colr = @import("colr.zig");
 pub const cbdt = @import("cbdt.zig");
 pub const gsub = @import("gsub.zig");
+pub const gpos = @import("gpos.zig");
 pub const layout = @import("layout.zig");
 pub const emoji = @import("emoji.zig");
 pub const fallback = @import("fallback.zig");
@@ -126,6 +128,7 @@ test {
     _ = colr;
     _ = cbdt;
     _ = gsub;
+    _ = gpos;
     _ = layout;
     _ = emoji;
     _ = fallback;
